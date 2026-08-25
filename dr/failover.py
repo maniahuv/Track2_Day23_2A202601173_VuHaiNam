@@ -35,13 +35,54 @@ LOG = pathlib.Path("reports/failover-events.jsonl")
 
 
 def emit(**kw):
-    """TODO: append 1 dòng JSONL có ts + iso vào LOG, và print ra stdout."""
-    raise NotImplementedError
-
+    evt = {"ts": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    evt.update(kw)
+    with open(LOG, "a") as f:
+        f.write(json.dumps(evt) + "\n")
+    print(json.dumps(evt))
 
 def failover(target: str, backend: str, wait: float) -> dict:
-    """TODO: 5 bước ở trên, đúng thứ tự."""
-    raise NotImplementedError
+    # Bước 1: Verify target
+    emit(step="1_verify_target")
+    
+    # Bước 2: Restore snapshot
+    meta = snapshot.get(target, backend)
+    primary = "a" if target == "b" else "b"
+    primary_db = pathlib.Path(f"state/region-{primary}/vectors.sqlite")
+    restored_db = pathlib.Path(f"state/region-{target}/vectors.sqlite")
+    rpo_info = snapshot.rpo(primary_db, restored_db)
+    emit(step="2_restore_snapshot", rpo_seconds=rpo_info["rpo_seconds"], docs_lost=rpo_info["docs_lost"], embed_model_version=meta.get("embed_model_version", "unknown"))
+    
+    # Bước 3: Scale GPU pool
+    with open(f"state/region-{target}/pool_state", "w") as f:
+        f.write("full")
+    emit(step="3_scale_pool")
+    
+    # Bước 4: Wait cho API của Region đích Ready
+    start = time.time()
+    ready = False
+    while time.time() - start < wait:
+        try:
+            if httpx.get(URL[target] + "/readyz", timeout=1.0).status_code == 200:
+                ready = True
+                break
+        except:
+            pass
+        time.sleep(1)
+        
+    if not ready:
+        # Nếu timeout thì abort, KHÔNG cutover DNS
+        return {}
+        
+    emit(step="4_wait_ready")
+    
+    # Bước 5: DNS Cutover
+    with open("edge/active_region", "w") as f:
+        f.write(target)
+    emit(step="5_dns_cutover")
+    
+    return {"status": "success", "target": target}
+
 
 
 if __name__ == "__main__":

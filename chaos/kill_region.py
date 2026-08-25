@@ -93,10 +93,29 @@ def kill(region: str, mode: str, backend: str, force_both: bool, mock: bool):
         pid = pid_of(region)
         if pid is None:
             raise SystemExit(f"khong tim thay PID cua region-{region} trong {PID_DIR}")
-        # netblock: SIGSTOP -> TCP handshake vẫn xong nhưng không ai trả lời => request TREO
-        #           (đúng hành vi của iptables DROP ở tầng app)
-        # stop    : SIGKILL -> cổng đóng => ConnectError ngay
-        os.kill(pid, signal.SIGSTOP if mode == "netblock" else signal.SIGKILL)
+        # Xử lý tương thích đa nền tảng
+        if os.name == 'nt':
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            ntdll = ctypes.windll.ntdll
+            PROCESS_SUSPEND_RESUME = 0x0800
+            PROCESS_TERMINATE = 0x0001
+            
+            if mode == "netblock":
+                handle = kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, pid)
+                if handle:
+                    ntdll.NtSuspendProcess(handle)
+                    kernel32.CloseHandle(handle)
+            else:
+                handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+                if handle:
+                    kernel32.TerminateProcess(handle, 1)
+                    kernel32.CloseHandle(handle)
+        else:
+            # netblock: SIGSTOP -> TCP handshake vẫn xong nhưng không ai trả lời => request TREO
+            #           (đúng hành vi của iptables DROP ở tầng app)
+            # stop    : SIGKILL -> cổng đóng => ConnectError ngay
+            os.kill(pid, signal.SIGSTOP if mode == "netblock" else signal.SIGKILL)
     else:
         svc = f"serving-{region}"
         if mode == "stop":
@@ -111,8 +130,19 @@ def restore(region: str, backend: str):
     if backend == "bare":
         pid = pid_of(region)
         if pid:
-            os.kill(pid, signal.SIGCONT)
-            return event(action="restore", region=region, method="SIGCONT", pid=pid)
+            if os.name == 'nt':
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                ntdll = ctypes.windll.ntdll
+                PROCESS_SUSPEND_RESUME = 0x0800
+                handle = kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, pid)
+                if handle:
+                    ntdll.NtResumeProcess(handle)
+                    kernel32.CloseHandle(handle)
+                return event(action="restore", region=region, method="NtResumeProcess", pid=pid)
+            else:
+                os.kill(pid, signal.SIGCONT)
+                return event(action="restore", region=region, method="SIGCONT", pid=pid)
         return event(action="restore", region=region, method="need_manual_start",
                      note="process da bi SIGKILL, chay `make up-bare` lai")
     subprocess.run(["docker", "compose", "start", f"serving-{region}"], check=False)
