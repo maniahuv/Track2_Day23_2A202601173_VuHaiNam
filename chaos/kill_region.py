@@ -38,6 +38,7 @@ import httpx
 EVENTS = pathlib.Path("chaos/chaos-events.jsonl")
 PID_DIR = pathlib.Path("run")
 URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
+PORT = {"a": 8001, "b": 8002}
 
 
 def event(**kw):
@@ -63,16 +64,131 @@ def is_alive(region: str, timeout=1.5) -> bool:
         return False
 
 
+def _win_kernel32():
+    # PHAI khai bao restype=HANDLE (64-bit) cho OpenProcess -- mac dinh ctypes
+    # coi no tra ve c_int (32-bit) va cat cut handle tren Windows 64-bit, khien
+    # OpenProcess tuong nhu that bai voi MOI pid (verify: process ranh ranh con
+    # song van bi bao "chet").
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    return kernel32
+
+
+def _win_ntdll():
+    import ctypes
+    from ctypes import wintypes
+    ntdll = ctypes.windll.ntdll
+    ntdll.NtSuspendProcess.argtypes = [wintypes.HANDLE]
+    ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+    return ntdll
+
+
+def _pid_alive(pid: int) -> bool:
+    if os.name == 'nt':
+        # os.kill(pid, 0) tren Windows KHONG phai no-op -- no goi TerminateProcess
+        # that su (da verify: process chet ngay). Phai dung OpenProcess query-only.
+        kernel32 = _win_kernel32()
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def pid_of(region: str) -> int | None:
     f = PID_DIR / f"region-{region}.pid"
     if not f.exists():
         return None
     pid = int(f.read_text().strip())
+    return pid if _pid_alive(pid) else None
+
+
+def _win_pid_listening_on(port: int) -> int | None:
+    """run/region-<r>.pid ghi PID cua `$!` trong bash, nhung tren may nay khong
+    dang tin: `.venv/Scripts/python.exe -m uvicorn` co the tach thanh 1 process
+    con rieng (khong co execve() thay image nhu POSIX), va process cha bash thay
+    duoc doi khi da THOAT hen truoc do -- pid trong file co the la mo coi, khong
+    con lien he cha/con voi process dang thuc su lang nghe. Cach dang tin duy nhat
+    la hoi he dieu hanh: ai dang LISTEN tren cong nay. Dung `netstat -ano` thay vi
+    tu dung GetExtendedTcpTable de tranh phu thuoc layout struct theo phien ban Win.
+    """
     try:
-        os.kill(pid, 0)
-        return pid
-    except OSError:
+        out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True,
+                              timeout=5).stdout
+    except Exception:
         return None
+    needle = f"127.0.0.1:{port} "
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0] == "TCP" and parts[1].startswith(needle.strip()) \
+                and parts[3] == "LISTENING":
+            try:
+                return int(parts[-1])
+            except ValueError:
+                return None
+    return None
+
+
+def _win_target_pid(region: str) -> int | None:
+    live = _win_pid_listening_on(PORT[region])
+    if live is not None:
+        return live
+    return pid_of(region)  # fallback: file PID (co the la stub, con hon khong co gi)
+
+
+def _win_process_tree(root_pid: int) -> list[int]:
+    """PID trong run/*.pid la process bash spawn (`$!`), nhung tren Windows
+    `.venv/Scripts/python.exe -m uvicorn` tu re-exec ra 1 process con moi that su
+    bind cong va tra response (khong co execve() thay the image nhu POSIX).
+    Suspend/kill dung mỗi root_pid la vo tac dung -- phai di het ca cay con.
+    Duyet toan bo process list bang Toolhelp32Snapshot (khong can psutil)."""
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x00000002
+
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    kernel32 = ctypes.windll.kernel32
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap == -1:
+        return [root_pid]
+
+    children_of: dict[int, list[int]] = {}
+    entry = PROCESSENTRY32()
+    entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+    try:
+        found = kernel32.Process32First(snap, ctypes.byref(entry))
+        while found:
+            children_of.setdefault(entry.th32ParentProcessID, []).append(entry.th32ProcessID)
+            found = kernel32.Process32Next(snap, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snap)
+
+    tree, stack = [], [root_pid]
+    while stack:
+        pid = stack.pop()
+        tree.append(pid)
+        stack.extend(children_of.get(pid, []))
+    return tree
 
 
 def kill(region: str, mode: str, backend: str, force_both: bool, mock: bool):
@@ -90,27 +206,27 @@ def kill(region: str, mode: str, backend: str, force_both: bool, mock: bool):
                other_region=other, other_alive=other_alive, forced_both=force_both,
                note="t_outage_start — moc 0 cua RTO clock")
     if backend == "bare":
-        pid = pid_of(region)
+        pid = _win_target_pid(region) if os.name == 'nt' else pid_of(region)
         if pid is None:
             raise SystemExit(f"khong tim thay PID cua region-{region} trong {PID_DIR}")
         # Xử lý tương thích đa nền tảng
         if os.name == 'nt':
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            ntdll = ctypes.windll.ntdll
+            kernel32 = _win_kernel32()
+            ntdll = _win_ntdll()
             PROCESS_SUSPEND_RESUME = 0x0800
             PROCESS_TERMINATE = 0x0001
-            
-            if mode == "netblock":
-                handle = kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, pid)
-                if handle:
-                    ntdll.NtSuspendProcess(handle)
-                    kernel32.CloseHandle(handle)
-            else:
-                handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
-                if handle:
-                    kernel32.TerminateProcess(handle, 1)
-                    kernel32.CloseHandle(handle)
+
+            for p in _win_process_tree(pid):
+                if mode == "netblock":
+                    handle = kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, p)
+                    if handle:
+                        ntdll.NtSuspendProcess(handle)
+                        kernel32.CloseHandle(handle)
+                else:
+                    handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, p)
+                    if handle:
+                        kernel32.TerminateProcess(handle, 1)
+                        kernel32.CloseHandle(handle)
         else:
             # netblock: SIGSTOP -> TCP handshake vẫn xong nhưng không ai trả lời => request TREO
             #           (đúng hành vi của iptables DROP ở tầng app)
@@ -128,17 +244,17 @@ def kill(region: str, mode: str, backend: str, force_both: bool, mock: bool):
 
 def restore(region: str, backend: str):
     if backend == "bare":
-        pid = pid_of(region)
+        pid = _win_target_pid(region) if os.name == 'nt' else pid_of(region)
         if pid:
             if os.name == 'nt':
-                import ctypes
-                kernel32 = ctypes.windll.kernel32
-                ntdll = ctypes.windll.ntdll
+                kernel32 = _win_kernel32()
+                ntdll = _win_ntdll()
                 PROCESS_SUSPEND_RESUME = 0x0800
-                handle = kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, pid)
-                if handle:
-                    ntdll.NtResumeProcess(handle)
-                    kernel32.CloseHandle(handle)
+                for p in _win_process_tree(pid):
+                    handle = kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, p)
+                    if handle:
+                        ntdll.NtResumeProcess(handle)
+                        kernel32.CloseHandle(handle)
                 return event(action="restore", region=region, method="NtResumeProcess", pid=pid)
             else:
                 os.kill(pid, signal.SIGCONT)
